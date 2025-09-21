@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections import deque
 
 import numpy as np
 import sklearn
@@ -45,6 +46,7 @@ def _MSE(y):
 # 7. refactoring an abstact base class, adding a regressor class
 # 8. fixing a bug with the max_leaf_nodes condition
 # 9. to make the classes compatible with RandomizedSearchCV, we need to follow the convention of get_params(): init params = attributes
+# 10. rewrote the build tree (heart of the CART algorithm), changing it from depth-first to breadth-first construction of the tree. KEY: this allows the max_leaf_nodes hyperparameter to work properly.
 
 class AbstractTreeEstimator(BaseEstimator, ABC):
     '''
@@ -75,70 +77,76 @@ class AbstractTreeEstimator(BaseEstimator, ABC):
         self._fitted = False
 
 
-    def _build_tree(self, node, X, y, indices):
+    def _build_tree(self, X, y):
         '''
         Takes a `node` and builds the decision tree with that as the root. returns None.\n
         `self` is used as a storage for all the regularization hyperparameters
         '''
-        # setup
-        lowest_impurity = np.inf
-        best_left_indices = None
-        best_right_indices = None
-        split_found = False
-        big_impurity_drop = False
-        node.impurity = self.impurity_measure(y[indices])
-        
-        # go condition
-        if len(indices) >= self.min_samples_split and node.depth < self.max_depth and self.n_leaf_nodes < self.max_leaf_nodes:
-            # for a random subset of the feature indices
-            for features_seen, fidx in enumerate(np.random.permutation(X.shape[1])):
-                if features_seen >= self.max_features and split_found and big_impurity_drop:
-                    break
-                ## an option for extremely randomized trees
-                if self.use_rand_thresh:                          
-                    possible_thresholds = [np.random.choice(X[indices, fidx])]
-                else:                                                   
-                    possible_thresholds = X[indices, fidx]
+        # breadth-first construction
+        q = deque()
+        q.append((self.tree_, np.arange(len(y))))
+        while len(q) > 0:
+            node, indices = q.popleft()
+            
+            # setup
+            lowest_impurity = np.inf
+            best_left_indices = None
+            best_right_indices = None
+            split_found = False
+            big_impurity_drop = False
+            node.impurity = self.impurity_measure(y[indices])
+            
+            # go condition
+            if len(indices) >= self.min_samples_split and node.depth < self.max_depth and self.n_leaf_nodes < self.max_leaf_nodes:
+                # for a random subset of the feature indices
+                for features_seen, fidx in enumerate(np.random.permutation(X.shape[1])):
+                    if features_seen >= self.max_features and split_found and big_impurity_drop:
+                        break
+                    ## an option for extremely randomized trees
+                    if self.use_rand_thresh:                          
+                        possible_thresholds = [np.random.choice(X[indices, fidx])]
+                    else:                                                   
+                        possible_thresholds = X[indices, fidx]
 
-                for threshold in possible_thresholds:
-                    # split
-                    mask = X[indices, fidx] <= threshold
-                    left_indices = indices[mask]
-                    right_indices = indices[~mask]
+                    for threshold in possible_thresholds:
+                        # split
+                        mask = X[indices, fidx] <= threshold
+                        left_indices = indices[mask]
+                        right_indices = indices[~mask]
 
-                    ## we only consider this split if the resulting children can be leaves.
-                    if len(left_indices) < self.min_samples_leaf or len(right_indices) < self.min_samples_leaf:
-                        continue
-                    else:
-                        split_found = True
+                        ## we only consider this split if the resulting children can be leaves.
+                        if len(left_indices) < self.min_samples_leaf or len(right_indices) < self.min_samples_leaf:
+                            continue
+                        else:
+                            split_found = True
 
-                    # find the impurities
-                    left_impurity = self.impurity_measure(y[left_indices])
-                    right_impurity = self.impurity_measure(y[right_indices])
-                    impurity = len(left_indices) / len(indices) * left_impurity + len(right_indices) / len(indices) * right_impurity
+                        # find the impurities
+                        left_impurity = self.impurity_measure(y[left_indices])
+                        right_impurity = self.impurity_measure(y[right_indices])
+                        impurity = len(left_indices) / len(indices) * left_impurity + len(right_indices) / len(indices) * right_impurity
 
-                    # recording the current lowest
-                    if impurity < lowest_impurity:
-                        lowest_impurity = impurity
-                        best_left_indices = left_indices
-                        best_right_indices = right_indices
-                        node.fidx = fidx
-                        node.threshold = threshold
-                        big_impurity_drop = len(indices) / len(y) * (node.impurity - lowest_impurity) >= self.min_impurity_decrease
+                        # recording the current lowest
+                        if impurity < lowest_impurity:
+                            lowest_impurity = impurity
+                            best_left_indices = left_indices
+                            best_right_indices = right_indices
+                            node.fidx = fidx
+                            node.threshold = threshold
+                            big_impurity_drop = len(indices) / len(y) * (node.impurity - lowest_impurity) >= self.min_impurity_decrease
 
-        # if we manage to find a decent split
-        if big_impurity_drop:
-            ## record feature importance
-            self.feature_importances_[node.fidx] += len(indices) / len(y) * (node.impurity - lowest_impurity)
+            # if we manage to find a decent split
+            if big_impurity_drop:
+                ## record feature importance
+                self.feature_importances_[node.fidx] += len(indices) / len(y) * (node.impurity - lowest_impurity)
 
-            node.left = _Node(depth=node.depth+1)
-            node.right = _Node(depth=node.depth+1)
-            self.n_leaf_nodes += 1
-            self._build_tree(node.left, X, y, best_left_indices)
-            self._build_tree(node.right, X, y, best_right_indices)
-        else:                                                               # leaf node
-            node.samples = len(indices)
-            self._handle_leaf_nodes(node, y, indices)
+                node.left = _Node(depth=node.depth+1)
+                node.right = _Node(depth=node.depth+1)
+                self.n_leaf_nodes += 1
+                q.append((node.left, best_left_indices))
+                q.append((node.right, best_right_indices))
+            else:                                                               # leaf node
+                node.samples = len(indices)
+                self._handle_leaf_nodes(node, y, indices)
 
     @abstractmethod
     def _handle_leaf_nodes(self, node, y, indices):
@@ -188,7 +196,7 @@ class AbstractTreeEstimator(BaseEstimator, ABC):
         # actually creating the tree
         self.tree_ = _Node(depth=0)
         indices = np.arange(X.shape[0])
-        self._build_tree(self.tree_, X, y, indices)
+        self._build_tree(X, y)
         self._fitted = True
         return self     
            
@@ -327,16 +335,16 @@ class MyTreeRegressor(RegressorMixin, AbstractTreeEstimator):
         return 1 - u / v
         
 
+def _test_baby_tree():
+    # baby tree
+    tree_clf = MyTreeClassifier()
+    X = np.array([[0],
+                  [1]])
+    y = np.array(["A", "B"])
+    tree_clf.fit(X, y)
+    print()
 
-def main():
-    # # baby tree
-    # tree_clf = MyTreeClassifier()
-    # X = np.array([[0],
-    #               [1]])
-    # y = np.array(["A", "B"])
-    # tree_clf.fit(X, y)
-
-
+def _test_decision_boundary():
     # prepare some moon data
     X, y = sklearn.datasets.make_moons(n_samples=10000, noise=0.4, random_state=42)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=43)
@@ -349,21 +357,30 @@ def main():
     plt.scatter(X[:, 0], X[:, 1], c=y, cmap="inferno")
     disp = DecisionBoundaryDisplay.from_estimator(my_tree_clf, X, response_method="predict", ax=plt.gca(), alpha=0.5, cmap="viridis_r")
     plt.show()
-    # print("Sklearn's tree classifier's test accuracy:", tree_clf.score(X_test, y_test))
-    # sklearn.tree.plot_tree(tree_clf)
-    # plt.show()
 
-    # my_tree_clf = MyTreeClassifier(random_state=41)
-    # param_distrib = {
-    #     "max_leaf_nodes": np.arange(2, 100),
-    #     "max_depth": np.arange(2, 20),
-    #     "min_samples_split": np.arange(2, 6)
-    # }
-    # rscv = RandomizedSearchCV(my_tree_clf, param_distrib, n_iter=10, cv=3)
-    # rscv.fit(X_train, y_train)
-    # print("Best estimator: ", repr(rscv.best_estimator_))
-    # print("Mean val accuracy score of the best estimator:", rscv.best_score_)
-    # print("Test accuracy: ", rscv.best_estimator_.score(X_test, y_test))
+def _test_RSCV():
+    # prepare some moon data
+    X, y = sklearn.datasets.make_moons(n_samples=10000, noise=0.4, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=43)   
+
+    # randomized search cv
+    my_tree_clf = MyTreeClassifier(random_state=41)
+    param_distrib = {
+        "max_leaf_nodes": np.arange(2, 100),
+        "max_depth": np.arange(2, 10),
+        "min_samples_split": np.arange(2, 6)
+    }
+    rscv = RandomizedSearchCV(my_tree_clf, param_distrib, n_iter=10, cv=3)
+    rscv.fit(X_train, y_train)
+    print("Best estimator: ", repr(rscv.best_estimator_))
+    print("Mean val accuracy score of the best estimator:", rscv.best_score_)
+    print("Test accuracy: ", rscv.best_estimator_.score(X_test, y_test))
+
+
+def main():
+    #_test_baby_tree()
+    #_test_decision_boundary()
+    _test_RSCV()
 
     print("done")
 
